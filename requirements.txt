@@ -1,0 +1,8 @@
+python-telegram-bot
+pymongo[srv]
+requests
+certifi
+pytz
+apscheduler
+flask
+gunicorn

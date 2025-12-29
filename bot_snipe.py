@@ -42,7 +42,7 @@ from telegram.request import HTTPXRequest
 
 # --- KONFIGURASI ---
 # ⚠️ PASTIKAN PASSWORD MONGODB BENAR DI SINI
-MONGO_URI = "mongodb+srv://farrel:<db_password>@snipe-bot.mzzmjcw.mongodb.net/?appName=snipe-bot"
+MONGO_URI = "mongodb+srv://farrel:farrel123@snipe-bot.mzzmjcw.mongodb.net/?appName=snipe-bot"
 
 HELIUS_API_KEY = "6e59391b-7fc3-4fd1-81bb-725d257dc15c"
 TELEGRAM_TOKEN = "8462035005:AAFVrV4J_6sDE76ad95c1fPQCu-Wt7HhMM0"

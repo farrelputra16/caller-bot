@@ -2,6 +2,7 @@ import logging
 import requests
 import certifi
 import asyncio
+import time
 from datetime import datetime
 from pymongo import MongoClient
 import pytz 
@@ -9,29 +10,17 @@ import os
 from threading import Thread
 from flask import Flask
 
-# --- 🛠️ BAGIAN 1: SERVER PALSU (AGAR BISA GRATIS DI RENDER) 🛠️ ---
+# --- 🛠️ FAKE SERVER (RENDER KEEPALIVE) 🛠️ ---
 app_flask = Flask('')
-
 @app_flask.route('/')
-def home():
-    return "Bot is running!"
+def home(): return "Solana Sniper V4.5 Running"
+def run_http(): app_flask.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+def keep_alive(): Thread(target=run_http).start()
 
-def run_http():
-    # Render memberikan PORT lewat environment variable
-    port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_http)
-    t.start()
-# ---------------------------------------------------------------
-
-# --- 🛠️ BAGIAN 2: FIX TIMEZONE MAC/LINUX 🛠️ ---
+# --- 🛠️ TIMEZONE FIX 🛠️ ---
 import apscheduler.util
-def fix_timezone_error(tz):
-    return pytz.UTC
+def fix_timezone_error(tz): return pytz.UTC
 apscheduler.util.astimezone = fix_timezone_error
-# -------------------------------------------------------------
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -40,10 +29,8 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-# --- KONFIGURASI ---
-# ⚠️ PASTIKAN PASSWORD MONGODB BENAR DI SINI
+# --- CONFIGURATION ---
 MONGO_URI = "mongodb+srv://farrel:farrel123@snipe-bot.mzzmjcw.mongodb.net/?appName=snipe-bot"
-
 HELIUS_API_KEY = "6e59391b-7fc3-4fd1-81bb-725d257dc15c"
 TELEGRAM_TOKEN = "8462035005:AAFVrV4J_6sDE76ad95c1fPQCu-Wt7HhMM0"
 
@@ -52,7 +39,7 @@ DEFAULT_TIME_WINDOW = 300
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- DATABASE ---
+# --- DATABASE CONNECTION ---
 try:
     client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
     db = client[DB_NAME]
@@ -62,33 +49,80 @@ except Exception as e:
     print(f"❌ Database Error: {e}")
 
 active_signals = {}
-GROUP_NAME, MIN_VOTE, ADD_WALLET, CONFIRM_EXIT = range(4)
+GROUP_NAME, MIN_VOTE, ADD_WALLET_WIZARD, ADD_WALLET_SINGLE = range(4)
 
-# --- UI HELPERS ---
-def get_main_menu():
-    keyboard = [
-        [InlineKeyboardButton("➕ Create New Group", callback_data='create_group')],
-        [InlineKeyboardButton("📋 My Groups", callback_data='list_groups')],
-        [InlineKeyboardButton("🗑 Delete Group", callback_data='delete_menu')]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+# --- ANALYTICS HELPERS (NEW) ---
+
+def get_holder_stats(token_mint):
+    """Calculates Top 10 Holders % using Helius RPC"""
+    try:
+        url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        
+        # 1. Get Top Holders
+        payload_holders = {
+            "jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts",
+            "params": [token_mint]
+        }
+        res_holders = requests.post(url, json=payload_holders, timeout=3).json()
+        
+        # 2. Get Total Supply
+        payload_supply = {
+            "jsonrpc": "2.0", "id": 2, "method": "getTokenSupply",
+            "params": [token_mint]
+        }
+        res_supply = requests.post(url, json=payload_supply, timeout=3).json()
+        
+        if 'result' in res_holders and 'result' in res_supply:
+            holders = res_holders['result']['value']
+            total_supply = float(res_supply['result']['value']['uiAmount'])
+            
+            # Sum Top 10
+            top10_sum = sum([float(h['uiAmount']) for h in holders[:10] if h['uiAmount']])
+            percentage = (top10_sum / total_supply) * 100
+            return f"{percentage:.2f}%"
+            
+    except Exception as e:
+        print(f"Holder Stat Error: {e}")
+    return "N/A"
 
 def get_token_info(token_address):
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-        res = requests.get(url, timeout=5).json()
+        res = requests.get(url, timeout=4).json()
         if res.get("pairs"):
             pair = res["pairs"][0]
             return {
                 "name": pair["baseToken"]["name"],
                 "symbol": pair["baseToken"]["symbol"],
                 "mcap": pair.get("fdv", 0),
+                "liquidity": pair.get("liquidity", {}).get("usd", 0),
+                "volume": pair.get("volume", {}).get("h24", 0),
                 "price": pair["priceUsd"],
                 "url": pair["url"]
             }
-    except:
-        pass
+    except: pass
     return None
+
+# --- UI HELPERS ---
+
+def get_main_menu():
+    keyboard = [
+        [InlineKeyboardButton("🚀 Create New Group", callback_data='create_group')],
+        [InlineKeyboardButton("📂 Manage My Groups", callback_data='manage_groups')],
+        [InlineKeyboardButton("🔄 Refresh Menu", callback_data='refresh_menu')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button(pattern='back_main'):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=pattern)]])
+
+def is_valid_solana(text):
+    text = text.strip()
+    if len(text) < 32 or len(text) > 44: return False
+    if " " in text: return False
+    if not text.isalnum(): return False
+    return True
 
 def is_tx_processed(signature):
     return processed_col.find_one({"signature": signature}) is not None
@@ -96,139 +130,244 @@ def is_tx_processed(signature):
 def mark_tx_processed(signature, wallet):
     processed_col.insert_one({"signature": signature, "wallet": wallet, "createdAt": datetime.utcnow()})
 
-# --- HANDLERS ---
+# --- HANDLERS (START & WIZARD) ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.first_name
-    await update.message.reply_text(
-        f"👋 **Hello {user}!**\nTargeting & Sniping Bot Ready.",
-        reply_markup=get_main_menu(), parse_mode="Markdown"
-    )
+    text = f"👋 **Hello {user}!**\nWelcome to **Solana Sniper Dashboard**.\n\nReady to catch the next gem? Select an option:"
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=get_main_menu(), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
-async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.edit_message_text("👇 **Main Menu:**", reply_markup=get_main_menu(), parse_mode="Markdown")
-
-# --- CONVERSATION HANDLERS (CREATE) ---
+# --- WIZARD: CREATE GROUP ---
 async def create_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.edit_message_text("🆕 **Step 1:** Type Group Name.", parse_mode="Markdown")
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🆕 **Step 1/3: Group Name**\n\nName your group (e.g. *Alpha Wallets*).", reply_markup=get_back_button(), parse_mode="Markdown")
     return GROUP_NAME
 
 async def receive_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['temp_group_name'] = update.message.text
-    await update.message.reply_text("🆕 **Step 2:** Min Wallets to Trigger Alert? (e.g. 2)", parse_mode="Markdown")
+    name = update.message.text.strip()
+    if not name: return GROUP_NAME 
+    context.user_data['temp_group_name'] = name
+    await update.message.reply_text(f"✅ Name: **{name}**\n\n🆕 **Step 2/3: Sensitivity**\nMin wallets to trigger alert? (e.g. *2*)", reply_markup=get_back_button(), parse_mode="Markdown")
     return MIN_VOTE
 
 async def receive_min_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         vote = int(update.message.text)
+        if vote < 1: raise ValueError
         context.user_data['temp_min_vote'] = vote
         context.user_data['temp_wallets'] = []
-        await update.message.reply_text("🆕 **Step 3:** Paste Wallet Address.", parse_mode="Markdown")
-        return ADD_WALLET
-    except:
-        await update.message.reply_text("❌ Number only.")
+        await update.message.reply_text(f"🎯 Target: **{vote} Wallets**\n\n🆕 **Step 3/3: Add Wallets**\nPaste addresses one by one. Click Finish when done.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Save", callback_data='save_new_group')]]), parse_mode="Markdown")
+        return ADD_WALLET_WIZARD
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number.")
         return MIN_VOTE
 
-async def receive_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wallet = update.message.text.strip()
-    context.user_data['temp_wallets'].append(wallet)
-    count = len(context.user_data['temp_wallets'])
-    keyboard = [[InlineKeyboardButton("➕ Add More", callback_data='add_more'), InlineKeyboardButton("✅ Finish", callback_data='save_group')]]
-    await update.message.reply_text(f"✅ Wallet #{count} Added!", reply_markup=InlineKeyboardMarkup(keyboard))
-    return CONFIRM_EXIT
+async def receive_wallet_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not is_valid_solana(text): return ADD_WALLET_WIZARD
+    if text not in context.user_data['temp_wallets']:
+        context.user_data['temp_wallets'].append(text)
+        count = len(context.user_data['temp_wallets'])
+        await update.message.reply_text(f"✅ **Wallet #{count} Added!**\n`{text[:6]}...`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish & Save", callback_data='save_new_group')]]), parse_mode="Markdown")
+    return ADD_WALLET_WIZARD
 
-async def loop_add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.edit_message_text("👇 Paste next wallet:")
-    return ADD_WALLET
-
-async def finish_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    chat_id = update.effective_chat.id
-    groups_col.insert_one({
-        "chat_id": chat_id,
-        "group_name": context.user_data['temp_group_name'],
-        "min_confluence": context.user_data['temp_min_vote'],
-        "wallets": context.user_data['temp_wallets'],
-        "created_at": datetime.utcnow()
-    })
-    await update.callback_query.edit_message_text("🎉 **Group Saved!**", parse_mode="Markdown")
+async def save_new_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    wallets = context.user_data.get('temp_wallets', [])
+    if not wallets:
+        await query.message.reply_text("⚠️ Add at least 1 wallet.")
+        return ADD_WALLET_WIZARD
+    groups_col.insert_one({"chat_id": update.effective_chat.id, "group_name": context.user_data['temp_group_name'], "min_confluence": context.user_data['temp_min_vote'], "wallets": wallets, "created_at": datetime.utcnow()})
+    await query.edit_message_text(f"🎉 **Group Created!**")
+    await query.message.reply_text("👇 **Main Menu:**", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- DASHBOARD HANDLERS ---
+async def show_groups_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    groups = list(groups_col.find({"chat_id": update.effective_chat.id}))
+    if not groups:
+        await query.edit_message_text("📭 No groups found.", reply_markup=get_back_button())
+        return
+    keyboard = [[InlineKeyboardButton(f"📂 {g['group_name']} ({len(g['wallets'])})", callback_data=f"manage_{g['_id']}")] for g in groups]
+    keyboard.append([InlineKeyboardButton("🔙 Main Menu", callback_data='back_main')])
+    await query.edit_message_text("📋 **Select Group:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def manage_single_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    from bson.objectid import ObjectId
+    group_id = query.data.split("_")[1]
+    group = groups_col.find_one({"_id": ObjectId(group_id)})
+    if not group: return
+    context.user_data['editing_group_id'] = group_id
+    details = f"⚙️ **{group['group_name']}**\nTrigger: {group['min_confluence']} | Wallets: {len(group['wallets'])}"
+    keyboard = [[InlineKeyboardButton("➕ Add Wallet", callback_data=f"addw_{group_id}"), InlineKeyboardButton("➖ Remove Wallet", callback_data=f"rmw_menu_{group_id}")], [InlineKeyboardButton("🗑 Delete Group", callback_data=f"delg_confirm_{group_id}")], [InlineKeyboardButton("🔙 Back", callback_data='manage_groups')]]
+    await query.edit_message_text(details, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# --- ADD/REMOVE WALLETS (DASHBOARD) ---
+async def start_add_single_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text("✍️ **Paste New Wallet:**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data='cancel_add')]]), parse_mode="Markdown")
+    return ADD_WALLET_SINGLE
+
+async def receive_single_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not is_valid_solana(text): return ADD_WALLET_SINGLE
+    from bson.objectid import ObjectId
+    groups_col.update_one({"_id": ObjectId(context.user_data.get('editing_group_id'))}, {"$addToSet": {"wallets": text}})
+    await update.message.reply_text(f"✅ Added `{text[:6]}...`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Group", callback_data=f"manage_{context.user_data.get('editing_group_id')}")]]))
+    return ConversationHandler.END
+
+async def cancel_add_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await manage_single_group(update, context)
+    return ConversationHandler.END
+
+async def remove_wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from bson.objectid import ObjectId
+    group_id = update.callback_query.data.split("_")[2]
+    group = groups_col.find_one({"_id": ObjectId(group_id)})
+    keyboard = [[InlineKeyboardButton(f"❌ {w[:6]}...{w[-4:]}", callback_data=f"rmx_{group_id}_{w[:15]}")] for w in group['wallets']]
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"manage_{group_id}")])
+    await update.callback_query.edit_message_text("🗑 **Tap to remove:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def exec_remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split("_")
+    from bson.objectid import ObjectId
+    group = groups_col.find_one({"_id": ObjectId(parts[1])})
+    wallet = next((w for w in group['wallets'] if w.startswith(parts[2])), None)
+    if wallet:
+        groups_col.update_one({"_id": ObjectId(parts[1])}, {"$pull": {"wallets": wallet}})
+        await query.answer("Removed!", show_alert=True)
+        await remove_wallet_menu(update, context)
+
+async def confirm_delete_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gid = update.callback_query.data.split("_")[2]
+    kb = [[InlineKeyboardButton("🔥 YES DELETE", callback_data=f"delg_exec_{gid}")], [InlineKeyboardButton("🔙 CANCEL", callback_data=f"manage_{gid}")]]
+    await update.callback_query.edit_message_text("⚠️ **Delete this group?**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def exec_delete_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from bson.objectid import ObjectId
+    groups_col.delete_one({"_id": ObjectId(update.callback_query.data.split("_")[2])})
+    await update.callback_query.edit_message_text("✅ Deleted.", reply_markup=get_back_button('manage_groups'))
+
+async def cancel_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Canceled.", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-# --- LIST & DELETE ---
-async def list_groups_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    groups = list(groups_col.find({"chat_id": update.effective_chat.id}))
-    msg = "📋 **Groups:**\n" + "\n".join([f"- {g['group_name']} ({len(g['wallets'])} wallets)" for g in groups]) if groups else "📭 Empty."
-    await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_main')]]), parse_mode="Markdown")
+# --- 🚀 MONITOR ENGINE & ALERT LOGIC ---
 
-async def delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    groups = list(groups_col.find({"chat_id": update.effective_chat.id}))
-    if not groups: return await list_groups_btn(update, context)
-    kb = [[InlineKeyboardButton(f"❌ {g['group_name']}", callback_data=f"del_{g['group_name']}")] for g in groups] + [[InlineKeyboardButton("🔙 Back", callback_data='back_main')]]
-    await update.callback_query.edit_message_text("🗑 **Delete which one?**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-
-async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    groups_col.delete_one({"chat_id": update.effective_chat.id, "group_name": update.callback_query.data[4:]})
-    await update.callback_query.edit_message_text("✅ Deleted.", reply_markup=get_main_menu())
-
-# --- MONITOR TASK ---
 async def monitor_task(context: ContextTypes.DEFAULT_TYPE):
-    for group in list(groups_col.find()):
-        if 'chat_id' not in group or not group.get('wallets'): continue
-        for wallet in group['wallets']:
-            try:
-                resp = requests.get(f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={HELIUS_API_KEY}&type=SWAP", timeout=5)
-                if resp.status_code == 200 and resp.json():
-                    tx = resp.json()[0]
-                    if is_tx_processed(tx['signature']): continue
-                    
-                    bought = next((t['mint'] for t in tx.get('tokenTransfers', []) if t['toUserAccount'] == wallet and t['mint'] not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]), None)
-                    if bought:
-                        mark_tx_processed(tx['signature'], wallet)
-                        await process_snipe(context, group['chat_id'], group['group_name'], wallet, bought, group['min_confluence'])
-            except: pass
+    groups = list(groups_col.find())
+    tasks = [check_single_group(context, group) for group in groups]
+    if tasks: await asyncio.gather(*tasks)
 
-async def process_snipe(context, chat_id, group_name, wallet, token, min_req):
-    import time
+async def check_single_group(context, group):
+    if 'chat_id' not in group or not group.get('wallets'): return
+    wallets, chat_id, group_name, min_req = group['wallets'], group['chat_id'], group['group_name'], group['min_confluence']
+    
+    for wallet in wallets:
+        try:
+            url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={HELIUS_API_KEY}&type=SWAP"
+            resp = requests.get(url, timeout=4)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    tx, sig = data[0], data[0]['signature']
+                    if not is_tx_processed(sig):
+                        bought_mint = None
+                        ignore = ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
+                        for t in tx.get('tokenTransfers', []):
+                            if t['toUserAccount'] == wallet and t['mint'] not in ignore:
+                                bought_mint = t['mint']
+                                break
+                        if bought_mint:
+                            mark_tx_processed(sig, wallet)
+                            await trigger_alert(context, chat_id, group_name, wallet, bought_mint, min_req)
+        except: pass
+
+async def trigger_alert(context, chat_id, group_name, wallet, token, min_req):
+    ts = time.time()
     sid = f"{token}_{chat_id}"
-    if sid in active_signals and time.time() - active_signals[sid]['start_time'] > DEFAULT_TIME_WINDOW: del active_signals[sid]
-    if sid not in active_signals: active_signals[sid] = {"wallets": set(), "start_time": time.time(), "alerted": False}
+    if sid in active_signals and ts - active_signals[sid]['start_time'] > DEFAULT_TIME_WINDOW: del active_signals[sid]
+    if sid not in active_signals: active_signals[sid] = {"wallets": set(), "start_time": ts, "alerted": False}
     
     active_signals[sid]['wallets'].add(wallet)
     count = len(active_signals[sid]['wallets'])
     
     if count >= min_req and not active_signals[sid]['alerted']:
         active_signals[sid]['alerted'] = True
-        info = get_token_info(token) or {"name": "Unknown", "symbol": "???", "price": "0", "mcap": 0, "url": "#"}
-        msg = f"🚨 <b>{group_name} ALERT!</b>\n⚡ <b>{count} Wallets!</b>\n💎 {info['name']} ({info['symbol']})\n<code>{token}</code>\n💵 ${info['price']} | 🧢 ${info['mcap']:,.0f}\n<a href='{info['url']}'>DexScreener</a>"
+        
+        # Fetch Info & Holders
+        info = get_token_info(token) or {"name": "Unknown", "symbol": "???", "mcap": 0, "price": "0", "url": "#", "liquidity": 0, "volume": 0}
+        holders_pct = get_holder_stats(token) # 🆕 Fetch Top 10 Holders %
+        
+        # Formatting
+        mcap = f"${info['mcap']:,.0f}" if info['mcap'] else "-"
+        liq = f"${info['liquidity']:,.0f}" if info['liquidity'] else "-"
+        vol = f"${info['volume']:,.0f}" if info['volume'] else "-"
+        
+        # 🆕 Links for Padre & Axiom
+        padre_link = f"https://padre.gg/token/{token}"
+        axiom_link = f"https://axiom.trade/token/{token}"
+        photon_link = f"https://photon-sol.tinyastro.io/en/lp/{token}"
+        
+        msg = (
+            f"🚨 <b>SNIPER ALERT: {group_name}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ <b>{count} Wallets Apeing!</b>\n\n"
+            f"💎 <b>{info['name']} ({info['symbol']})</b>\n"
+            f"🎫 <code>{token}</code>\n\n"
+            f"📊 <b>Stats:</b>\n"
+            f"💵 Price: ${info['price']}\n"
+            f"🧢 MCap: {mcap}\n"
+            f"💧 Liq: {liq} | 🔊 Vol: {vol}\n"
+            f"🐳 <b>Top 10 Holders: {holders_pct}</b>\n\n"
+            f"👇 <b>Quick Links:</b>\n"
+            f"🦅 <a href='{info['url']}'>DexScreener</a> | 🛡️ <a href='{padre_link}'>Padre</a>\n"
+            f"⚡ <a href='{axiom_link}'>Axiom</a> | 🌟 <a href='{photon_link}'>Photon</a>"
+        )
         try: await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", disable_web_page_preview=True)
         except: pass
 
 # --- MAIN ---
 if __name__ == "__main__":
-    # 1. JALANKAN SERVER PALSU (AGAR RENDER TIDAK MEMATIKAN BOT)
     keep_alive()
-
     defaults = Defaults(tzinfo=pytz.UTC)
-    req = HTTPXRequest(connection_pool_size=20, read_timeout=30, write_timeout=30, connect_timeout=30)
+    req = HTTPXRequest(connection_pool_size=100, read_timeout=20, write_timeout=20, connect_timeout=20)
     app = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).request(req).build()
 
-    conv_handler = ConversationHandler(
+    conv_create = ConversationHandler(
         entry_points=[CallbackQueryHandler(create_group_start, pattern='^create_group$')],
-        states={GROUP_NAME: [MessageHandler(filters.TEXT, receive_group_name)], MIN_VOTE: [MessageHandler(filters.TEXT, receive_min_vote)], ADD_WALLET: [MessageHandler(filters.TEXT, receive_wallet)], CONFIRM_EXIT: [CallbackQueryHandler(loop_add_wallet, pattern='^add_more$'), CallbackQueryHandler(finish_group, pattern='^save_group$')]},
-        fallbacks=[CommandHandler('cancel', cancel)]
+        states={GROUP_NAME: [MessageHandler(filters.TEXT, receive_group_name)], MIN_VOTE: [MessageHandler(filters.TEXT, receive_min_vote)], ADD_WALLET_WIZARD: [MessageHandler(filters.TEXT, receive_wallet_wizard)]},
+        fallbacks=[CallbackQueryHandler(save_new_group, pattern='^save_new_group$'), CommandHandler('cancel', cancel_global)]
+    )
+    
+    conv_add = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_add_single_wallet, pattern='^addw_')],
+        states={ADD_WALLET_SINGLE: [MessageHandler(filters.TEXT, receive_single_wallet)]},
+        fallbacks=[CallbackQueryHandler(cancel_add_single, pattern='^cancel_add$'), CommandHandler('cancel', cancel_global)]
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(list_groups_btn, pattern='^list_groups$'))
-    app.add_handler(CallbackQueryHandler(delete_menu, pattern='^delete_menu$'))
-    app.add_handler(CallbackQueryHandler(confirm_delete, pattern='^del_'))
+    app.add_handler(conv_create)
+    app.add_handler(conv_add)
     app.add_handler(CallbackQueryHandler(back_to_main, pattern='^back_main$'))
+    app.add_handler(CallbackQueryHandler(show_groups_list, pattern='^manage_groups$'))
+    app.add_handler(CallbackQueryHandler(start, pattern='^refresh_menu$'))
+    app.add_handler(CallbackQueryHandler(manage_single_group, pattern='^manage_'))
+    app.add_handler(CallbackQueryHandler(remove_wallet_menu, pattern='^rmw_menu_'))
+    app.add_handler(CallbackQueryHandler(exec_remove_wallet, pattern='^rmx_'))
+    app.add_handler(CallbackQueryHandler(confirm_delete_group, pattern='^delg_confirm_'))
+    app.add_handler(CallbackQueryHandler(exec_delete_group, pattern='^delg_exec_'))
 
-    app.job_queue.run_repeating(monitor_task, interval=12, first=5)
+    app.job_queue.run_repeating(monitor_task, interval=5, first=2)
+    print("🚀 Bot V4.5 (Rich Alerts + Holders) Started...")
     app.run_polling()

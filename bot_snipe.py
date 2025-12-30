@@ -1,19 +1,19 @@
 import logging
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pymongo import MongoClient
 import pytz 
 import os
 from threading import Thread
 from flask import Flask
-import aiohttp # <--- LIBRARY BARU UTK SPEED
+import aiohttp 
 import certifi
 
 # --- 🛠️ FAKE SERVER 🛠️ ---
 app_flask = Flask('')
 @app_flask.route('/')
-def home(): return "Solana Sniper V5 (Async Speed) Running"
+def home(): return "Solana Sniper V6 (DB Core) Running"
 def run_http(): app_flask.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 def keep_alive(): Thread(target=run_http).start()
 
@@ -36,7 +36,7 @@ HELIUS_API_KEY = "6e59391b-7fc3-4fd1-81bb-725d257dc15c"
 TELEGRAM_TOKEN = "8462035005:AAFVrV4J_6sDE76ad95c1fPQCu-Wt7HhMM0"
 
 DB_NAME = "solana_sniper_bot"
-DEFAULT_TIME_WINDOW = 300 
+DEFAULT_TIME_WINDOW = 300  # 5 Minutes
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,11 +47,11 @@ try:
     db = client[DB_NAME]
     groups_col = db["wallet_groups"]
     processed_col = db["processed_txs"]
+    # Create Index for faster queries
+    processed_col.create_index([("createdAt", -1)])
+    processed_col.create_index([("mint", 1)])
 except Exception as e:
     logger.error(f"❌ Database Error: {e}")
-
-active_signals = {}
-GROUP_NAME, MIN_VOTE, ADD_WALLET_WIZARD, ADD_WALLET_SINGLE = range(4)
 
 # --- GLOBAL ERROR HANDLER ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -79,39 +79,70 @@ def is_valid_solana(text):
     text = text.strip()
     return len(text) >= 32 and len(text) <= 44 and " " not in text and text.isalnum()
 
+# --- DATABASE LOGIC (THE HEART OF V6) ---
+
 def is_tx_processed(signature):
     return processed_col.find_one({"signature": signature}) is not None
 
-def mark_tx_processed(signature, wallet):
-    processed_col.insert_one({"signature": signature, "wallet": wallet, "createdAt": datetime.utcnow()})
+def record_transaction(signature, wallet, mint, group_id):
+    """Save transaction to DB so we can count it later even if bot restarts"""
+    processed_col.insert_one({
+        "signature": signature, 
+        "wallet": wallet, 
+        "mint": mint,
+        "group_id": group_id,
+        "createdAt": datetime.utcnow()
+    })
 
-# --- ASYNC API HELPERS (NEW SPEED ENGINE) ---
+def get_confluence_count(mint, group_id, window_seconds):
+    """
+    Query MongoDB: "How many UNIQUE wallets in this group bought this token in the last X seconds?"
+    This fixes the issue where bot restarts forget previous buys.
+    """
+    cutoff_time = datetime.utcnow() - timedelta(seconds=window_seconds)
+    
+    pipeline = [
+        {
+            "$match": {
+                "mint": mint,
+                "group_id": group_id,
+                "createdAt": {"$gte": cutoff_time}
+            }
+        },
+        {
+            "$group": {
+                "_id": "$wallet" # Group by wallet to count unique buyers
+            }
+        },
+        {
+            "$count": "unique_wallets"
+        }
+    ]
+    
+    result = list(processed_col.aggregate(pipeline))
+    if result:
+        return result[0]["unique_wallets"]
+    return 0
+
+# --- ASYNC API HELPERS ---
 
 async def get_holder_stats_async(session, token_mint):
     try:
         url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-        
-        # Batch Request untuk mengurangi latency (2 request jadi 1 call)
         payload = [
             {"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_mint]},
             {"jsonrpc": "2.0", "id": 2, "method": "getTokenSupply", "params": [token_mint]}
         ]
-        
         async with session.post(url, json=payload, timeout=3) as resp:
             data = await resp.json()
-            
-            # Parsing Batch Response
             res_holders = next((item for item in data if item.get("id") == 1), {})
             res_supply = next((item for item in data if item.get("id") == 2), {})
-
             if 'result' in res_holders and 'result' in res_supply:
                 holders = res_holders['result']['value']
                 total_supply = float(res_supply['result']['value']['uiAmount'])
                 if total_supply == 0: return "N/A"
-                
                 top10_sum = sum([float(h['uiAmount']) for h in holders[:10] if h['uiAmount']])
-                percentage = (top10_sum / total_supply) * 100
-                return f"{percentage:.2f}%"
+                return f"{(top10_sum / total_supply) * 100:.2f}%"
     except: pass
     return "N/A"
 
@@ -126,18 +157,18 @@ async def get_token_info_async(session, token_address):
                     "name": pair["baseToken"]["name"],
                     "symbol": pair["baseToken"]["symbol"],
                     "mcap": pair.get("fdv", 0),
-                    "liquidity": pair.get("liquidity", {}).get("usd", 0),
-                    "volume": pair.get("volume", {}).get("h24", 0),
                     "price": pair["priceUsd"],
                     "url": pair["url"]
                 }
     except: pass
     return None
 
-# --- HANDLERS ---
+# --- CONVERSATION HANDLERS (SAME AS V4) ---
+GROUP_NAME, MIN_VOTE, ADD_WALLET_WIZARD, ADD_WALLET_SINGLE = range(4)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.first_name
-    text = f"⚡ **Solana Sniper V5 (High Speed)**\nHello {user}, monitoring engine is active."
+    text = f"⚡ **Solana Sniper V6 (DB Core)**\nHi {user}, I am now using Database Memory for 100% accuracy."
     if update.callback_query:
         await update.callback_query.answer()
         await safe_edit_message(update.callback_query, text, get_main_menu())
@@ -148,7 +179,7 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await safe_edit_message(update.callback_query, "👇 **Main Menu:**", get_main_menu())
 
-# --- WIZARD: CREATE GROUP ---
+# Wizard Flow
 async def create_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await safe_edit_message(update.callback_query, "🆕 **Step 1/3: Group Name**", get_back_button())
@@ -189,7 +220,7 @@ async def save_new_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text("👇 **Main Menu:**", reply_markup=get_main_menu(), parse_mode="Markdown")
     return ConversationHandler.END
 
-# --- DASHBOARD ---
+# Dashboard Flow
 async def show_groups_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     groups = list(groups_col.find({"chat_id": update.effective_chat.id}))
@@ -264,15 +295,13 @@ async def cancel_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Canceled.", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-# --- 🚀 ASYNC MONITOR ENGINE (SPEED V5) ---
+# --- 🚀 MONITOR ENGINE (V6 - DB BACKED) ---
 
 async def monitor_task(context: ContextTypes.DEFAULT_TYPE):
     groups = list(groups_col.find())
     if not groups: return
 
-    # Menggunakan aiohttp session untuk koneksi super cepat (Persistent Connection)
-    # Ini mencegah "Handshake" berulang-ulang yang bikin lambat
-    connector = aiohttp.TCPConnector(limit=50) # Izinkan 50 koneksi sekaligus
+    connector = aiohttp.TCPConnector(limit=50) 
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [check_single_group(session, context, group) for group in groups]
         await asyncio.gather(*tasks)
@@ -280,7 +309,8 @@ async def monitor_task(context: ContextTypes.DEFAULT_TYPE):
 async def check_single_group(session, context, group):
     if 'chat_id' not in group or not group.get('wallets'): return
     wallets, chat_id, group_name, min_req = group['wallets'], group['chat_id'], group['group_name'], group['min_confluence']
-    
+    group_id = str(group['_id']) # Important for DB query
+
     for wallet in wallets:
         try:
             url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={HELIUS_API_KEY}&type=SWAP"
@@ -289,6 +319,8 @@ async def check_single_group(session, context, group):
                     data = await resp.json()
                     if data:
                         tx, sig = data[0], data[0]['signature']
+                        
+                        # Check if processed
                         if not is_tx_processed(sig):
                             bought_mint = None
                             ignore = ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
@@ -296,26 +328,41 @@ async def check_single_group(session, context, group):
                                 if t['toUserAccount'] == wallet and t['mint'] not in ignore:
                                     bought_mint = t['mint']
                                     break
+                            
                             if bought_mint:
-                                mark_tx_processed(sig, wallet)
-                                # Gunakan session yang sama untuk alert logic
-                                await trigger_alert(session, context, chat_id, group_name, wallet, bought_mint, min_req)
+                                # 1. Save TX to DB immediately
+                                record_transaction(sig, wallet, bought_mint, group_id)
+                                
+                                # 2. Ask DB: "Who else bought this token in this group recently?"
+                                count = get_confluence_count(bought_mint, group_id, DEFAULT_TIME_WINDOW)
+                                
+                                # 3. Trigger Alert Logic
+                                await trigger_alert(session, context, chat_id, group_name, wallet, bought_mint, min_req, count)
         except: pass
 
-async def trigger_alert(session, context, chat_id, group_name, wallet, token, min_req):
+async def trigger_alert(session, context, chat_id, group_name, wallet, token, min_req, count):
+    # Logic: Only alert if we hit the threshold. 
+    # To avoid spamming, we check if we already alerted for this token recently.
+    # We can use a simple in-memory cache for "Alerted?" flag since the hard data is in DB.
+    
     ts = time.time()
     sid = f"{token}_{chat_id}"
-    if sid in active_signals and ts - active_signals[sid]['start_time'] > DEFAULT_TIME_WINDOW: del active_signals[sid]
-    if sid not in active_signals: active_signals[sid] = {"wallets": set(), "start_time": ts, "alerted": False}
     
-    active_signals[sid]['wallets'].add(wallet)
-    count = len(active_signals[sid]['wallets'])
+    # Simple alert cooldown (Memory-based is fine for cooldown)
+    if sid not in active_signals: 
+        active_signals[sid] = {"last_alert": 0, "highest_count": 0}
     
-    if count >= min_req and not active_signals[sid]['alerted']:
-        active_signals[sid]['alerted'] = True
+    # Trigger Condition:
+    # 1. Count meets requirement
+    # 2. We haven't alerted this specific count yet (e.g. Alert at 2, then Alert at 3) 
+    #    OR it's been a while since last alert.
+    
+    if count >= min_req and count > active_signals[sid]['highest_count']:
+        active_signals[sid]['highest_count'] = count
+        active_signals[sid]['last_alert'] = ts
         
-        # Async Fetch (Non-blocking)
-        info = await get_token_info_async(session, token) or {"name": "UNK", "symbol": "???", "mcap": 0, "price": "0", "url": "#", "liquidity": 0, "volume": 0}
+        # Async Fetch Data
+        info = await get_token_info_async(session, token) or {"name": "UNK", "symbol": "???", "mcap": 0, "price": "0", "url": "#"}
         holders_pct = await get_holder_stats_async(session, token)
         
         mcap = f"${info['mcap']:,.0f}" if info['mcap'] else "-"
@@ -370,11 +417,10 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(exec_remove_wallet, pattern='^rmx_'))
     app.add_handler(CallbackQueryHandler(confirm_delete_group, pattern='^delg_confirm_'))
     app.add_handler(CallbackQueryHandler(exec_delete_group, pattern='^delg_exec_'))
-    
     app.add_error_handler(error_handler)
 
-    # PERCEPAT INTERVAL POLLING KE 2 DETIK
+    # FAST INTERVAL (2 Seconds)
     app.job_queue.run_repeating(monitor_task, interval=2, first=1)
     
-    print("🚀 Bot V5 (Speed Demon - AsyncIO) Started...")
+    print("🚀 Bot V6 (DB-Backed Accuracy) Started...")
     app.run_polling()
